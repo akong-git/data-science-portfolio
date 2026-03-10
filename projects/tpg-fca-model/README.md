@@ -1,153 +1,147 @@
-# TPG FCA Credit Risk Model
+# TPG FCA 2026 Underwriting Model
 
 ## What I Built
 
-An end-to-end ML feature engineering pipeline for predicting advance loan losses in SBTPG's tax-season financial products. Built entirely from scratch -- from raw IRS tax return data and Experian credit bureau responses to production-ready binned features consumed by a trained credit risk model.
+An end-to-end ML feature engineering and scoring pipeline for SBTPG's FCA (Fast Cash Advance) underwriting model. I extracted ~350 raw features from IRS tax return data, Experian credit bureau responses, and 3 years of filing history, then distilled them to 12 binned features consumed by an XGBoost model deployed on AWS SageMaker. The model predicts the likelihood of insufficient IRS refund ("No-IRS-Pay") for tax-season advance loan applicants.
 
-This project spans two systems:
-1. **Credit risk feature pipeline** (data science): 9 dbt models producing 500+ features from IRS data, credit bureau, and 3 years of filing history, distilled to 12 binned features for ML scoring
-2. **Advance loan operations** (analytics engineering): 7+ dbt models tracking the full lifecycle of advance loans -- disbursement, daily collections, outstanding balances, and exposure monitoring
+I built the entire data pipeline in dbt/SQL on Redshift: 6 intermediate models for feature extraction, 3 mart models for feature assembly and binning, plus the Implementation Programming Specifications document shared with Model Risk Management.
 
 ## Business Context
 
-SBTPG processes ~20M tax returns annually. For a subset of filers, TPG provides advance loans -- cash before the IRS refund arrives. The risk: if the refund is smaller than expected (IRS offset, partial payment, fraud), the advance isn't fully repaid.
+SBTPG processes ~20M tax returns annually. For a subset of filers, TPG provides advance loans (FCA, ERA, RA) -- cash before the IRS refund arrives. The risk: if the refund is smaller than expected (IRS offset, partial payment, fraud), the advance isn't fully repaid.
 
-I built the feature pipeline to predict which loans will result in losses, enabling the underwriting team to make better approval decisions.
+The FCA 2026 model scores each loan application in real time via SageMaker. The ERO/Transmitter sends applicant tax data to TPG, which extracts the 12 features, sends them to the SageMaker API Gateway, and receives a probability (0-1). The final score = `ROUND((1 - probability) * 1000)` (1-999 scale, higher = lower risk).
 
-## Feature Engineering Highlights
+**Model performance (FCA 2026 vs FCA 2025):**
 
-- **200+ IRS form field features** pivoted from EAV storage (W-2 wages, 1040 fields, Schedule EIC, Schedule C)
-- **30+ Experian credit bureau attributes** integrated from two source systems
-- **50 knockout business rules** encoded (minimum age, deceased check, prior-year debt, withholding ratio thresholds)
-- **3-year cross-year features:** YoY deltas for EIC, wages, prep fees; refund coverage analysis; preparer switching detection
-- **Financial ratios:** EIC utilization (`r_eic2maxeic`), refund accuracy (`r_actual2expectedirsrefund`), withholding consistency (`w_ratio`)
-- **12 production-ready binned features** with ordinal bins matching the trained model's expected input format
+| Metric | FCA 2026 | FCA 2025 | Lift |
+|--------|----------|----------|------|
+| KS | 30.4 | 26.5 | +15% |
+| AUROC | 0.702 | 0.677 | +4% |
+| GINI | 0.404 | 0.354 | +14% |
+| No-IRS-Pay captured (worst 10%) | 30.8% | 28.0% | +10% |
+| No-IRS-Pay captured (worst 20%) | 47.7% | 42.9% | +11% |
+
+**Training data:** 224,402 records (FCA 2025 applicants), 4.5% No-IRS-Pay rate. XGBoost with Bayesian hyperparameter tuning (100 rounds), sample weighting for class imbalance. 64/16/20 train/test/validation split. Out-of-time validation on FCA 2024 data confirmed no overfitting.
 
 ## Architecture
-
-### Credit Risk Feature Pipeline
 
 ```mermaid
 flowchart TD
     subgraph Sources["Data Sources"]
-        IRS["IRS Tax Returns\n(EAV format)"]
-        EXP["Experian\nCredit Bureau"]
-        APP["Application\nData"]
-        PSC["PSC Scoring\n(S3 external)"]
+        IRS["IRS Tax Returns\n(EAV format)\ntaxreturnheader/detail"]
+        EXP["Experian Credit Bureau\ntpg + gbos_vip\n(dual source)"]
+        APP["Application Data\ntpg.application\ntpg.loanapplication"]
+        PSC["PSC Scoring File\ndatascience.fca2025_06_psc\n(S3 external)"]
     end
 
     subgraph Intermediate["6 Intermediate Models"]
-        APPL["int_tpg_fca_applicants\n─────────────────\nApplicant universe\nFiling year scoping"]
-        TAX["int_tpg_fca_tax_returns\n─────────────────\n200+ IRS fields pivoted\nW-2, 1040, Sched EIC/C"]
-        CRED["int_tpg_fca_credit_bureau\n─────────────────\n30+ Experian attributes\nDual source integration"]
-        KNOCK["int_tpg_fca_knockout_rules\n─────────────────\n50 business rules\nMin age, deceased, debt"]
-        ACH["int_tpg_fca_ach\n─────────────────\nACH routing data"]
-        PSCI["int_tpg_fca_psc\n─────────────────\nPSC target variable\nExternal model score"]
+        APPL["int_tpg__fca_applicants\n─────────────────\nBase universe: all identitytokens\nwith loan apps in FY 2023-2025\nPrior-year IRS payment history"]
+        TAX["int_tpg__tax_return_attributes\n─────────────────\n200+ IRS fields pivoted from EAV\nW-2, 1040, Sched EIC/C\nIncremental on (token, taxyear)"]
+        CRED["int_tpg__experian_attributes\n─────────────────\n30+ P13 attributes\nVerification, OFAC, military\nDual source COALESCE"]
+        KNOCK["int_tpg__knockout_and_scoring\n─────────────────\n50 business rules\nSHAP scores, denial reasons\nRisk category assignment"]
+        ACH["int_tpg__ach_and_fees\n─────────────────\nFederal/state ACH amounts\nPreparation fees"]
+        PSCI["int_tpg__psc_file\n─────────────────\nPSC target variable\nhist_2y payment history\nModel scope filtering"]
     end
 
-    subgraph CrossYear["Prior-Year Features"]
-        YOY["3-Year Lookback\n──────────────────\nYoY deltas: EIC, wages, fees\nRefund coverage analysis\nPreparer switching detection"]
+    subgraph Marts["3 Mart Models"]
+        FEAT["mrt_tpg__fca_model_features\n──────────────────\n500+ columns joined\nDerived ratios: EIC/maxEIC,\nactual/expected refund, w_ratio"]
+        PY["mrt_tpg__fca_model_prior_year_features\n──────────────────\n3-year cross-year deltas\nRefund coverage analysis\nPreparer switching detection"]
+        FINAL["mrt_tpg__fca_model_final_features\n──────────────────\n12 binned features\nOrdinal CASE WHEN encoding\nFY2025, PSC scope filter"]
     end
 
-    subgraph Assembly["Feature Assembly"]
-        FEAT["500+ Raw Features\n──────────────────\nFinancial ratios\nEIC utilization\nWithholding consistency"]
-    end
-
-    subgraph Output["Production Output"]
-        BIN["12 Binned Features\n──────────────────\nSQL CASE WHEN bins\nOrdinal encoding\nModel-ready format"]
-        ML["ML Credit Risk Model\n──────────────────\nAdvance loan\napproval decisions"]
+    subgraph Scoring["Real-Time Scoring"]
+        API["SageMaker API Gateway\n──────────────────\nXGBoost endpoint\nP(no-IRS-pay) → score 1-999"]
+        DECISION["Underwriting Decision\n──────────────────\nScore cutoffs for approval/denial\nLoan tier assignment\n$300-$7,000"]
     end
 
     IRS --> TAX
     EXP --> CRED
     APP --> APPL
     PSC --> PSCI
-    APPL --> Assembly
-    TAX --> Assembly
-    CRED --> Assembly
-    KNOCK --> Assembly
-    ACH --> Assembly
-    PSCI --> Assembly
-    TAX --> CrossYear
-    Assembly --> FEAT
-    CrossYear --> FEAT
-    FEAT --> BIN
-    BIN --> ML
+    APPL --> FEAT
+    TAX --> FEAT
+    CRED --> FEAT
+    KNOCK --> FEAT
+    ACH --> FEAT
+    PSCI --> FEAT
+    TAX --> PY
+    FEAT --> PY
+    PY --> FINAL
+    FINAL --> API
+    API --> DECISION
 
     style Sources fill:#2d3748,stroke:#4a5568,color:#e2e8f0
     style Intermediate fill:#2c5282,stroke:#2b6cb0,color:#bee3f8
-    style CrossYear fill:#744210,stroke:#975a16,color:#fefcbf
-    style Assembly fill:#2f855a,stroke:#38a169,color:#c6f6d5
-    style Output fill:#9b2c2c,stroke:#c53030,color:#fed7d7
+    style Marts fill:#2f855a,stroke:#38a169,color:#c6f6d5
+    style Scoring fill:#9b2c2c,stroke:#c53030,color:#fed7d7
 ```
-
-### Advance Loan Operations Pipeline
 
 ```mermaid
 flowchart LR
-    subgraph Input["Input"]
-        APP2["Application\nData"]
+    subgraph Pipeline["End-to-End Scoring Flow"]
+        ERO["ERO/Transmitter\nsends tax data"] --> TPG["TPG extracts\n12 features"]
+        TPG --> GW["SageMaker\nAPI Gateway"]
+        GW --> EP["XGBoost\nEndpoint"]
+        EP --> RESP["P(no-IRS-pay)\n0 to 1"]
+        RESP --> SCORE["Score =\nROUND((1-p)*1000)"]
+        SCORE --> DEC["Approval/Denial\n+ Loan Amount"]
     end
 
-    subgraph Waterfall["Waterfall Model"]
-        WF["Dual Collection Paths\n───────────────────\nRefund waterfall\nDisbursement fee waterfall"]
-    end
-
-    subgraph Lifecycle["Loan Lifecycle"]
-        DISB["Disbursements\nA / B / C patterns"]
-        COLL["Collections\nUNION both paths"]
-        BAL["Outstanding\nBalances"]
-    end
-
-    subgraph Reports["Reporting"]
-        DAILY["Daily Reports"]
-        TRIAL["Trial Balance"]
-        REPAID["Fully-Repaid\nTracking"]
-    end
-
-    APP2 --> WF
-    WF --> DISB
-    WF --> COLL
-    DISB --> BAL
-    COLL --> BAL
-    BAL --> DAILY
-    BAL --> TRIAL
-    BAL --> REPAID
-
-    style Input fill:#2d3748,stroke:#4a5568,color:#e2e8f0
-    style Waterfall fill:#553c9a,stroke:#6b46c1,color:#e9d8fd
-    style Lifecycle fill:#2c5282,stroke:#2b6cb0,color:#bee3f8
-    style Reports fill:#2f855a,stroke:#38a169,color:#c6f6d5
+    style Pipeline fill:#2d3748,stroke:#4a5568,color:#e2e8f0
 ```
 
-See [architecture.md](architecture.md) for detailed DAGs and waterfall mechanics.
+See [architecture.md](architecture.md) for detailed DAGs and materialization strategy.
+
+## The 12 Model Features
+
+These 12 features were selected from ~350 candidates through iterative feature importance analysis, partial dependence plots, and correlation reduction. Each is binned into ordinal integers via SQL CASE WHEN, matching the trained model's expected input format.
+
+| # | Feature | Bins | What It Captures |
+|---|---------|------|-----------------|
+| 1 | `risk_f` | 5 | 3-year IRS payment history risk factor (from PSC file) |
+| 2 | `pct_standard_children` | 6 | % of qualifying children with standard relationships (son/daughter/grandchild) vs non-standard -- fraud signal |
+| 3 | `py_rrec_hist` | 3 | Prior-year IRS repayment history: Full (F), Partial (P), None (N) |
+| 4 | `cnt_irs1040scheduleeic_qualifyingchildssn` | 4 | Count of distinct qualifying child SSNs on Schedule EIC |
+| 5 | `days_from_tax_season_start_date` | 11 | Days between loan application and Jan 2, 2026 (tax season start) |
+| 6 | `cnt_irs1040schedulec` | 5 | Count of distinct Schedule C document IDs (self-employment indicator) |
+| 7 | `r_actual2expectedirsrefund_prev` | 6 | Ratio of actual/expected IRS refund for TY2024 (separate JH vs non-JH logic) |
+| 8 | `r_actual2expectedirsrefund_prev2` | 6 | Same ratio for TY2023 (2-year lookback) |
+| 9 | `w_ratio` | 5 | Tax withholding ratio: total withholding / max(total income, wages, withholding) |
+| 10 | `irsw2_socialsecuritywagesamount` | 15 | Total W-2 Social Security wages (employment indicator) |
+| 11 | `r_eic2expectedirsrefund` | 11 | EIC / expected IRS refund ratio |
+| 12 | `r_eic2maxeic` | 8 | EIC utilization: actual EIC / statutory max EIC for qualifying child count |
 
 ## Key Technical Decisions
 
-1. **SQL-native feature engineering:** All 500+ features computed in dbt/SQL rather than Python. This keeps the pipeline in a single system, makes features auditable, and eliminates data movement between platforms.
+1. **SQL-native feature engineering:** All ~350 features computed in dbt/SQL rather than Python. This keeps the pipeline in a single system, makes features auditable, and eliminates data movement between platforms.
 
-2. **Incremental tax return processing:** Tax return attributes use `incremental` materialization with compound unique key `(identitytoken, taxyear)`. This handles the 200+ column pivot efficiently -- only new/updated returns are reprocessed.
+2. **Incremental tax return processing:** `int_tpg__tax_return_attributes` uses `incremental` materialization with compound unique key `(identitytoken, taxyear)`. This handles the 200+ column pivot efficiently -- only new/updated returns are reprocessed.
 
-3. **Dual collection path handling:** Advance loan collections come from two waterfall sources (refund waterfall + disbursement fee waterfall). Missing either path understates collections by 10-20%. I UNION both sources in `int_tpg_fca_collections`.
+3. **Binning in SQL, not Python:** The 12 production features are discretized via CASE WHEN in SQL. Fixed bin boundaries match the trained model exactly -- no floating-point drift, no library dependencies, fully auditable.
 
-4. **Binning in SQL, not Python:** The 12 production features are discretized via CASE WHEN in SQL. Fixed bin boundaries match the trained model exactly -- no floating-point drift, no library dependencies, fully auditable.
+4. **Three-year lookback design:** The applicant universe spans 3 filing years (2023-2025) to enable prior-year feature computation. Cross-year self-joins produce YoY deltas for EIC, wages, refund coverage, and preparer switching.
 
-5. **Three-year lookback design:** The applicant universe spans 3 filing years (2023-2025) to enable prior-year feature computation. Cross-year self-joins produce YoY deltas for EIC, wages, refund coverage, and preparer switching.
+5. **JH vs Non-JH branching:** Several features (notably `r_actual2expectedirsrefund_prev`) have different source logic for Jackson Hewitt vs non-JH transmitters. JH uses transmitter-provided prior-year data (`RREC_PY_IRSPAY/REFUND`) while non-JH uses TPG database records.
+
+6. **EIC-aware sentinel values:** Features like `pct_standard_children` use sentinel bin values (1-3) for edge cases (EIC=0 + no dependents, EIC=0 + dependents, EIC>0 + no dependents) rather than treating them as missing data.
 
 ## Impact
 
-The feature pipeline feeds SBTPG's advance loan underwriting decisions. The 12 final features -- spanning prior-year IRS payment history, EIC utilization, filing timing, self-employment indicators, withholding ratios, and refund accuracy -- capture the strongest loss predictors identified during model training.
+The FCA 2026 model enables SBTPG to serve ~236K applicants with advance loans ranging from $300 to $7,000 (totaling ~$1.7B in IRS refund exposure). The model's score (1-999) drives both approval/denial cutoffs and loan tier assignment. In backtesting, the worst-scoring 5% had a 17.2% No-IRS-Pay rate vs 1.3% for the best 5% -- a 13x separation. The model outperforms its predecessor (FCA 2025) across all metrics, with a 15% KS lift.
 
 ## Technology
 
-- **Platform:** dbt on Amazon Redshift
+- **ML Platform:** AWS SageMaker (XGBoost, real-time endpoint)
+- **Feature Pipeline:** dbt on Amazon Redshift
 - **Sources:** `greendot.tpg` (80+ tables), `greendot.datascience`, `gbos_vip` (Experian)
-- **Scale:** 3 years of filing data, all loan applications, 200+ pivoted IRS attributes
+- **Scale:** 3 years of filing data, 224K+ applicants, 200+ pivoted IRS attributes, ~350 raw features → 12 production features
+- **Stakeholders:** Model Risk Management, Green Dot Bank Tax Refund Product, Risk IT, TPG IT
 
 ## Documentation
 
-- [Architecture](architecture.md) -- Three waterfall systems, dual DAGs, filing year scoping
-- [Model Catalog](model-catalog.md) -- All 15 models with grain and key logic
-- [Business Rules](business-rules.md) -- Waterfall mechanics, 50 knockout rules, PSC scoring, EIC caps
+- [Architecture](architecture.md) -- Pipeline DAG, materialization strategy, filing year scoping
+- [Model Catalog](model-catalog.md) -- All 9 data science models with grain and key logic
+- [Business Rules](business-rules.md) -- 50 knockout rules, PSC scoring, EIC caps, JH vs non-JH logic
 - [Technical Patterns](technical-patterns.md) -- Tax return pivoting, Experian integration, cross-year features, binning
 - [LLM Context](llm-context.md) -- AI-readable summary
