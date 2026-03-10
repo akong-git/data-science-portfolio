@@ -25,31 +25,99 @@ I built the feature pipeline to predict which loans will result in losses, enabl
 
 ## Architecture
 
-```
-IRS Tax Data + Experian + Application Data + PSC Scoring
-                    │
-        ┌───────────┼───────────┐
-        ▼           ▼           ▼
-   6 Intermediate    Feature     External
-   Models            Assembly    Scoring
-   (applicants,      (500+       (S3 → PSC
-    tax returns,     columns)    target var)
-    credit bureau,
-    knockout rules,
-    ACH, PSC)
-        │
-        ▼
-   Prior-Year Features (YoY deltas, refund coverage)
-        │
-        ▼
-   Final Features (12 binned features → ML model)
+### Credit Risk Feature Pipeline
+
+```mermaid
+flowchart TD
+    subgraph Sources["Data Sources"]
+        IRS["IRS Tax Returns\n(EAV format)"]
+        EXP["Experian\nCredit Bureau"]
+        APP["Application\nData"]
+        PSC["PSC Scoring\n(S3 external)"]
+    end
+
+    subgraph Intermediate["6 Intermediate Models"]
+        APPL["int_tpg_fca_applicants\n─────────────────\nApplicant universe\nFiling year scoping"]
+        TAX["int_tpg_fca_tax_returns\n─────────────────\n200+ IRS fields pivoted\nW-2, 1040, Sched EIC/C"]
+        CRED["int_tpg_fca_credit_bureau\n─────────────────\n30+ Experian attributes\nDual source integration"]
+        KNOCK["int_tpg_fca_knockout_rules\n─────────────────\n50 business rules\nMin age, deceased, debt"]
+        ACH["int_tpg_fca_ach\n─────────────────\nACH routing data"]
+        PSCI["int_tpg_fca_psc\n─────────────────\nPSC target variable\nExternal model score"]
+    end
+
+    subgraph CrossYear["Prior-Year Features"]
+        YOY["3-Year Lookback\n──────────────────\nYoY deltas: EIC, wages, fees\nRefund coverage analysis\nPreparer switching detection"]
+    end
+
+    subgraph Assembly["Feature Assembly"]
+        FEAT["500+ Raw Features\n──────────────────\nFinancial ratios\nEIC utilization\nWithholding consistency"]
+    end
+
+    subgraph Output["Production Output"]
+        BIN["12 Binned Features\n──────────────────\nSQL CASE WHEN bins\nOrdinal encoding\nModel-ready format"]
+        ML["ML Credit Risk Model\n──────────────────\nAdvance loan\napproval decisions"]
+    end
+
+    IRS --> TAX
+    EXP --> CRED
+    APP --> APPL
+    PSC --> PSCI
+    APPL --> Assembly
+    TAX --> Assembly
+    CRED --> Assembly
+    KNOCK --> Assembly
+    ACH --> Assembly
+    PSCI --> Assembly
+    TAX --> CrossYear
+    Assembly --> FEAT
+    CrossYear --> FEAT
+    FEAT --> BIN
+    BIN --> ML
+
+    style Sources fill:#2d3748,stroke:#4a5568,color:#e2e8f0
+    style Intermediate fill:#2c5282,stroke:#2b6cb0,color:#bee3f8
+    style CrossYear fill:#744210,stroke:#975a16,color:#fefcbf
+    style Assembly fill:#2f855a,stroke:#38a169,color:#c6f6d5
+    style Output fill:#9b2c2c,stroke:#c53030,color:#fed7d7
 ```
 
-**Operations side:**
-```
-Application data → Waterfall model → Collections (dual path) → Daily reports
-                                   → Disbursements            → Trial balance
-                                                              → Fully-repaid
+### Advance Loan Operations Pipeline
+
+```mermaid
+flowchart LR
+    subgraph Input["Input"]
+        APP2["Application\nData"]
+    end
+
+    subgraph Waterfall["Waterfall Model"]
+        WF["Dual Collection Paths\n───────────────────\nRefund waterfall\nDisbursement fee waterfall"]
+    end
+
+    subgraph Lifecycle["Loan Lifecycle"]
+        DISB["Disbursements\nA / B / C patterns"]
+        COLL["Collections\nUNION both paths"]
+        BAL["Outstanding\nBalances"]
+    end
+
+    subgraph Reports["Reporting"]
+        DAILY["Daily Reports"]
+        TRIAL["Trial Balance"]
+        REPAID["Fully-Repaid\nTracking"]
+    end
+
+    APP2 --> WF
+    WF --> DISB
+    WF --> COLL
+    DISB --> BAL
+    COLL --> BAL
+    BAL --> DAILY
+    BAL --> TRIAL
+    BAL --> REPAID
+
+    style Input fill:#2d3748,stroke:#4a5568,color:#e2e8f0
+    style Waterfall fill:#553c9a,stroke:#6b46c1,color:#e9d8fd
+    style Lifecycle fill:#2c5282,stroke:#2b6cb0,color:#bee3f8
+    style Reports fill:#2f855a,stroke:#38a169,color:#c6f6d5
 ```
 
 See [architecture.md](architecture.md) for detailed DAGs and waterfall mechanics.
