@@ -12,6 +12,16 @@ Helped design and build the feature store infrastructure, including the account-
 
 Feature stores are the bridge between raw data and ML models. Most data scientists work with pre-built features. I helped **build the feature store** that serves production ML models across risk, fraud, and customer lifecycle.
 
+## Scale
+
+- **19 dbt models** on Redshift
+- **13 feature domains** spanning transactions, disputes, balance health, authentication, customer service, login behavior, profitability, and customer segmentation
+- **3 rolling window intervals** (1-week, 5-week, 10-week) per metric
+- **Millions of account-weeks** processed incrementally
+- **Dual-grain architecture**: account-level (demographics) + account-week (behavioral)
+
+
+
 ## Architecture
 
 ```mermaid
