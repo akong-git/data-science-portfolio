@@ -6,9 +6,9 @@ Data Scientist with deep expertise in building production-grade data infrastruct
 
 ## What Sets Me Apart
 
-Most data scientists consume feature stores. **I build them.**
-Most data scientists hand off models. **I productionize them.**
-Most data scientists avoid SQL. **I architect data warehouses and pipelines with it.**
+Most data scientists consume feature stores. **I build them.**  
+Most data scientists hand off models. **I productionize them.**  
+Most data scientists avoid SQL. **I architect data warehouses and pipelines with it.**  
 Most data scientists stay in notebooks. **I lead cross-functional builds and present to executives.**
 
 ## 🏗️ Projects
