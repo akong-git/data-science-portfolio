@@ -171,3 +171,55 @@ WHERE filing_year = {{ var('filing_year', 2026) }}
 ```
 
 The `var('filing_year')` default advances each tax season. All models inherit the same parameter, ensuring the pipeline produces a consistent snapshot.
+
+## Column-Level Audit Framework
+
+To validate the migration, I built a Jinja-based audit model that compares every column between the legacy MicroStrategy output and the new dbt output, row by row. The pattern:
+
+```sql
+-- audit_rpt_efin_all_monitoring.sql (simplified)
+-- Compares ~130 columns between legacy source-of-truth and new dbt output
+
+{% set audit_columns = [
+    'total_volume', 'total_funded', 'fees_requested', 'fees_paid',
+    'debt_balance_due', 'fca_principal_owed', 'fca_collected',
+    -- ... ~130 columns total
+] %}
+
+WITH legacy AS (
+    SELECT monitoring_efin, {{ audit_columns | join(', ') }}
+    FROM {{ source('legacy', 'efin_all_monitoring_mstr') }}
+    WHERE filing_year = {{ var('filing_year') }}
+),
+
+dbt_output AS (
+    SELECT monitoring_efin, {{ audit_columns | join(', ') }}
+    FROM {{ ref('rpt_efin_all_monitoring') }}
+),
+
+comparison AS (
+    SELECT
+        COALESCE(l.monitoring_efin, d.monitoring_efin) AS monitoring_efin,
+        {% for col in audit_columns %}
+        CASE
+            WHEN l.{{ col }} IS NULL AND d.{{ col }} IS NULL THEN 'both_null'
+            WHEN l.{{ col }} = d.{{ col }} THEN 'match'
+            ELSE 'mismatch'
+        END AS {{ col }}_status
+        {%- if not loop.last %},{% endif %}
+        {% endfor %}
+    FROM legacy l
+    FULL OUTER JOIN dbt_output d USING (monitoring_efin)
+)
+
+-- Final output: match percentage per column, sorted worst-first
+SELECT
+    {% for col in audit_columns %}
+    ROUND(100.0 * SUM(CASE WHEN {{ col }}_status = 'match' THEN 1 ELSE 0 END)
+        / COUNT(*), 2) AS {{ col }}_match_pct
+    {%- if not loop.last %},{% endif %}
+    {% endfor %}
+FROM comparison
+```
+
+This immediately surfaces which columns have mismatches and at what rate, so I can prioritize fixes during migration. A mismatch in `total_volume` means a join logic difference; a mismatch in `debt_balance_due` means a pivot or filter issue. The audit model runs alongside production and gave stakeholders confidence in the cutover.
