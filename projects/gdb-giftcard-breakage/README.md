@@ -29,9 +29,9 @@ To address these deviations, in August 2023, we began a thorough review of our m
 
 | Document | Description |
 |----------|-------------|
-| [Model Methodology](docs/model-methodology.md) | Random Forest, Linear Regression, combined approach, and terminal period decisions |
-| [Execution Runbook](docs/execution-runbook.md) | Step-by-step monthly/quarterly execution guide (SageMaker, Excel review, SQL) |
-| [Data Pipeline](docs/data-pipeline.md) | Stored procedures, key tables, data lineage, and schema details |
+| [Model Methodology](model-methodology.md) | Random Forest, Linear Regression, combined approach, and terminal period decisions |
+| [Execution Runbook](execution-runbook.md) | Step-by-step monthly/quarterly execution guide (SageMaker, Excel review, SQL) |
+| [Data Pipeline](data-pipeline.md) | Stored procedures, key tables, data lineage, and schema details |
 
 ## 05. Repository Contents
 
