@@ -9,10 +9,11 @@ Help Andy present his work as a **Data Scientist who builds production-grade dat
 - LLM analyst design on top of curated reporting surfaces
 
 ## Repo structure (important)
+- `projects/ods-edw-build/` — ODS & EDW architecture, QA framework, stakeholder communication
 - `projects/feature-store/` — Feature store architecture, domains, patterns, and an `llm-context.md`
 - `projects/tpg-fca-model/` — FCA loan lifecycle + collections modeling (built from scratch)
 - `projects/tpg-operations-pipeline/` — Ops reporting pipeline modernization (freeform SQL → dbt) + LLM analyst vision
-- `skills/` — Skill summaries (may be added later)
+- `projects/gdb-giftcard-breakage/` — Gift card breakage revenue modeling (ASC 606)
 
 ## Content rules
 - Do **not** include proprietary SQL from employer repositories.
