@@ -105,3 +105,112 @@ This creates human-readable keys like `12345_52` (account 12345, week 52).
 | **CROSS JOIN size management** | acct_list filters to recently active accounts only |
 | **COALESCE to zero** | Avoids NULL handling downstream in ML pipelines |
 | **Incremental merge** | Only processes new/changed weeks, not full history |
+
+---
+
+## Complete Example: Rolling Window Feature Model
+
+Below is a sanitized, representative feature domain model showing the full spine-based pattern end-to-end. This is the pattern every `dsfs_aw_*` model follows:
+
+```sql
+-- dsfs_aw_disputes (simplified)
+-- Grain: one row per account per week
+-- Output: dispute counts and amounts at 1w, 5w, 10w rolling windows
+
+{{ config(
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key='acct_uid_week_key'
+) }}
+
+{% set dates = get_feature_store_dates() %}
+
+-- Step 1: Define week boundaries from date dimension
+WITH weekly_range AS (
+    SELECT
+        DATEDIFF(week, '2023-12-31', calendar_date) AS week_key,
+        MIN(calendar_date) AS week_start_date,
+        MAX(calendar_date) AS week_end_date
+    FROM {{ ref('dim_date') }}
+    WHERE calendar_date BETWEEN '{{ dates.look_back_start_date }}'
+                              AND '{{ dates.end_date }}'
+    GROUP BY 1
+),
+
+-- Step 2: Identify accounts with recent activity
+acct_list AS (
+    SELECT DISTINCT acct_uid
+    FROM {{ ref('dsfs_aw_base') }}
+    WHERE week_key >= DATEDIFF(week, '2023-12-31', '{{ dates.start_date }}')
+),
+
+-- Step 3: Cross join to create complete account × week grid
+all_combos AS (
+    SELECT a.acct_uid, w.week_key, w.week_start_date, w.week_end_date
+    FROM acct_list a
+    CROSS JOIN weekly_range w
+),
+
+-- Step 4: Aggregate source events to weekly grain
+weekly_agg AS (
+    SELECT
+        ac.acct_uid,
+        ac.week_key,
+        CAST(ac.acct_uid AS VARCHAR) || '_' || CAST(ac.week_key AS VARCHAR)
+            AS acct_uid_week_key,
+        COALESCE(COUNT(d.dispute_id), 0)           AS dispute_cnt,
+        COALESCE(SUM(d.dispute_amount), 0)         AS dispute_amt,
+        COALESCE(SUM(CASE WHEN d.is_fraud THEN 1 ELSE 0 END), 0)
+            AS fraud_dispute_cnt,
+        COALESCE(SUM(CASE WHEN d.is_granted THEN d.dispute_amount ELSE 0 END), 0)
+            AS granted_amt
+    FROM all_combos ac
+    LEFT JOIN {{ source('edw', 'fct_disputes') }} d
+        ON ac.acct_uid = d.acct_uid
+       AND d.dispute_date BETWEEN ac.week_start_date AND ac.week_end_date
+    GROUP BY 1, 2, 3
+),
+
+-- Step 5: Compute rolling windows
+rolling_window AS (
+    SELECT
+        acct_uid_week_key,
+        acct_uid,
+        week_key,
+
+        -- 1-week (current week only)
+        dispute_cnt                                AS dispute_cnt_1w,
+        dispute_amt                                AS dispute_amt_1w,
+        fraud_dispute_cnt                          AS fraud_dispute_cnt_1w,
+
+        -- 5-week rolling
+        SUM(dispute_cnt) OVER (
+            PARTITION BY acct_uid ORDER BY week_key
+            ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+        ) AS dispute_cnt_5w,
+        SUM(dispute_amt) OVER (
+            PARTITION BY acct_uid ORDER BY week_key
+            ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+        ) AS dispute_amt_5w,
+
+        -- 10-week rolling
+        SUM(dispute_cnt) OVER (
+            PARTITION BY acct_uid ORDER BY week_key
+            ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+        ) AS dispute_cnt_10w,
+        SUM(fraud_dispute_cnt) OVER (
+            PARTITION BY acct_uid ORDER BY week_key
+            ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+        ) AS fraud_dispute_cnt_10w
+
+    FROM weekly_agg
+)
+
+SELECT * FROM rolling_window
+
+{% if is_incremental() %}
+WHERE week_key >= (SELECT MAX(week_key) - 1 FROM {{ this }})
+{% endif %}
+```
+
+This pattern ensures: no missing weeks (cross join), no NULLs (COALESCE), consistent date boundaries (centralized macro), and efficient refreshes (incremental merge).
